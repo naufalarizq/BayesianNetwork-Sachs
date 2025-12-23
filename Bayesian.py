@@ -1,355 +1,560 @@
-# Bayesian.py
-import re
-import numpy as np
-import pandas as pd
-from collections import OrderedDict
-import networkx as nx
+# ============================================================
+# IMPLEMENTASI BAYESIAN NETWORK FROM SCRATCH
+# ============================================================
+
+import re                          # Digunakan untuk parsing string CPT dari file teks/CSV
+import numpy as np                 # Operasi numerik dan perhitungan probabilitas
+import pandas as pd                # Manipulasi dataset observasi
+from collections import OrderedDict  # Menjaga urutan CPT agar konsisten
+import networkx as nx              # Representasi graf DAG Bayesian Network
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
+from IPython.display import display
 
-# -----------------------
-# Helper: parse CPT string -> list of floats
-# -----------------------
+
+# ============================================================
+# HELPER: PARSING CPT
+# ============================================================
+
 def parse_cpt_values(cpt_string):
-    """Parse nilai probabilitas dari string CPT (numbers separated or inside parentheses)."""
+    """
+    Fungsi ini mengubah CPT yang awalnya berbentuk string
+    (misalnya "(0.2 0.3 0.5)") menjadi list float.
+
+    Ini diperlukan karena inferensi Bayesian membutuhkan
+    nilai probabilitas numerik, bukan representasi teks.
+    """
     if cpt_string is None:
         return []
-    vals = [float(x) for x in re.findall(r'[0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?', str(cpt_string))]
+
+    # Regex digunakan agar fleksibel terhadap format CPT
+    vals = [
+        float(x) for x in re.findall(
+            r'[0-9]+\.?[0-9]*(?:[eE][+-]?[0-9]+)?',
+            str(cpt_string)
+        )
+    ]
     return vals
 
-# -----------------------
-# Learn CPTs from data (MLE with optional Laplace smoothing)
-# Input:
-#   df: pandas DataFrame containing columns for all nodes (columns names = node names)
-#   node_list: list of node names (order independent)
-#   states: dict or common list of states (if dict: states[node] -> list)
-#   parents_map: dict {node: [parents]} if not provided, user supplies
-# Output:
-#   cpts_map: dict { (node, tuple(parents)) : list_of_probabilities_flattened }
-#   where flattened ordering: iterate over parent cartesian product (lexicographic) and for each parent combination list P(node=state) in order states[node]
+
+# ============================================================
+# PARAMETER LEARNING (MLE + LAPLACE SMOOTHING)
+# ============================================================
+
 def learn_cpts_from_data(df, node_list, states, parents_map, laplace=1.0):
     """
-    Estimate CPTs with counts from df.
-    Returns ordered dict of CPTs.
+    Fungsi ini mengimplementasikan pembelajaran parameter
+    Bayesian Network dari data observasi.
+
+    Secara teori:
+    P(X | Parents(X)) = N(X, Parents(X)) / N(Parents(X))
+
+    Laplace smoothing digunakan untuk mencegah probabilitas nol.
     """
+
     from itertools import product
+
+    # CPT disimpan dalam OrderedDict agar urutan konsisten
     cpts = OrderedDict()
-    # Ensure states mapping
+
+    # Menentukan state diskrit untuk setiap node
+    # Ini penting karena CPT bergantung pada urutan state
     node_states = {}
     if isinstance(states, dict):
         node_states = states
     else:
-        # same states for all nodes
         for n in node_list:
             node_states[n] = list(states)
 
+    # Iterasi setiap node dalam Bayesian Network
     for node in node_list:
+
+        # Ambil parent node sesuai struktur DAG
         parents = parents_map.get(node, []) or []
-        # If no parents: just frequency of node
+
+        # ====================================================
+        # KASUS 1: NODE TANPA PARENT (ROOT NODE)
+        # ====================================================
+        # P(X) dihitung langsung dari frekuensi data
         if len(parents) == 0:
-            counts = df[node].value_counts().reindex(node_states[node], fill_value=0).astype(float)
+
+            # Hitung frekuensi kemunculan setiap state
+            counts = (
+                df[node]
+                .value_counts()
+                .reindex(node_states[node], fill_value=0)
+                .astype(float)
+            )
+
+            # Laplace smoothing untuk menghindari probabilitas nol
             counts += laplace
+
+            # Normalisasi menjadi distribusi probabilitas
             probs = (counts / counts.sum()).tolist()
-            # store flattened: here length = #states
+
+            # Simpan sebagai CPT node tanpa parent
             cpts[(node, tuple(parents))] = probs
+
+        # ====================================================
+        # KASUS 2: NODE DENGAN PARENT
+        # ====================================================
+        # P(X | Y1, Y2, ...)
         else:
-            # compute counts for each parent combination
             parent_states_lists = [node_states[p] for p in parents]
+
+            # CPT disimpan dalam bentuk flattened list
             probs_flat = []
-            # iterate lexicographically over parent combinations
+
+            # Enumerasi semua kombinasi state parent (kartesian)
             for comb in product(*parent_states_lists):
-                # filter rows matching parent combination
+
+                # Filter data yang sesuai kombinasi parent
                 mask = np.ones(len(df), dtype=bool)
                 for p, val in zip(parents, comb):
                     mask &= (df[p] == val)
+
                 subset = df[mask]
-                counts = subset[node].value_counts().reindex(node_states[node], fill_value=0).astype(float)
+
+                # Hitung distribusi child node
+                counts = (
+                    subset[node]
+                    .value_counts()
+                    .reindex(node_states[node], fill_value=0)
+                    .astype(float)
+                )
+
+                # Laplace smoothing
                 counts += laplace
+
+                # Normalisasi
                 probs = (counts / counts.sum()).tolist()
-                probs_flat.extend(probs)  # append child-state probs for this parent combo
+
+                # Disimpan berurutan untuk tiap kombinasi parent
+                probs_flat.extend(probs)
+
             cpts[(node, tuple(parents))] = probs_flat
+
     return cpts, node_states
 
-# or
-def load_cpts_from_csv(path):
-    df_cpts = pd.read_csv(path)
-    cpts_loaded = {}
 
-    for _, row in df_cpts.iterrows():
-        node = row['node']
+# ============================================================
+# MENGAMBIL PROBABILITAS KONDISIONAL
+# ============================================================
 
-        # FIX untuk parent kosong ("" → NaN)
-        if pd.isna(row['parents']):
-            parents = []
-        else:
-            parents = str(row['parents']).strip().split()
-
-        # parse CPT array
-        probs = parse_cpt_values(row['data'])
-
-        # simpan
-        cpts_loaded[(node, tuple(parents))] = probs
-
-    return cpts_loaded
-
-# -----------------------
-# Save CPTs to CSV (same format as original: node, parents(space separated), data(string of space-separated floats))
-# -----------------------
-def save_cpts_to_csv(cpts_map, filepath):
-    
-    rows = []
-    for (node, parents), probs in cpts_map.items():
-        parents_str = " ".join(parents)
-        data_str = " ".join(str(float(x)) for x in probs)
-        rows.append({'node': node, 'parents': parents_str, 'data': data_str})
-    import pandas as pd
-    pd.DataFrame(rows)[['node','parents','data']].to_csv(filepath, index=False)
-
-# -----------------------
-# Get parents helper
-# -----------------------
-def get_parents_map_from_cpts(cpts_map):
-    parents_map = {}
-    for (node, parents) in cpts_map.keys():
-        parents_map.setdefault(node, list(parents))
-    return parents_map
-
-# -----------------------
-# Get probability P(node=state | parent_evidence)
-# cpts_map expected values are lists (floats) and ordering is:
-# for each parent combination (lexicographic), list of probs for node.states in order
-# -----------------------
 def get_probability(node, state, parent_evidence, node_states, cpts_map):
     """
-    parent_evidence: dict {parent: state}
-    node_states: dict {node: [state_list]}
+    Mengambil nilai:
+    P(node = state | parent_evidence)
+
+    Fungsi ini adalah operasi fundamental dalam inferensi Bayesian Network.
     """
+
+    # Cari CPT yang sesuai dengan node
     key = None
-    # find entry for node (any parents)
     for (n, parents) in cpts_map.keys():
         if n == node:
             key = (n, parents)
             break
+
     if key is None:
         return 0.0
+
     parents = list(key[1])
     probs = cpts_map[key]
-    # index into probs
+
+    # Indeks state node
     s_index = node_states[node].index(state)
 
+    # Jika node tidak memiliki parent
     if len(parents) == 0:
-        # probs is list of length S
         return probs[s_index]
-    # build parent indices lexicographically
+
+    # Hitung indeks kombinasi parent (mixed radix)
     parent_indices = []
     for p in parents:
-        p_state = parent_evidence.get(p)
-        if p_state is None:
-            # parent state missing -> cannot evaluate this conditional
+        if p not in parent_evidence:
             return 0.0
-        parent_indices.append(node_states[p].index(p_state))
-    # compute index: for lexicographic product parents, with fastest-changing dimension = node state
-    # we stored for each parent-combination the list [P(node=state1),P(node=state2),...]
-    # so index = (parent_comb_index) * S + s_index
-    # parent_comb_index computed as base-mixed radix
+        parent_indices.append(node_states[p].index(parent_evidence[p]))
+
     base = [len(node_states[p]) for p in parents]
     comb_index = 0
     for idx, b in zip(parent_indices, base):
         comb_index = comb_index * b + idx
-    index = comb_index * len(node_states[node]) + s_index
-    if index < 0 or index >= len(probs):
-        return 0.0
-    return probs[index]
 
-# -----------------------
-# Calculate joint probability for full assignment (assignment is dict node->state)
-# -----------------------
+    # Indeks akhir dalam CPT flattened
+    index = comb_index * len(node_states[node]) + s_index
+
+    return probs[index] if 0 <= index < len(probs) else 0.0
+
+
+# ============================================================
+# JOINT PROBABILITY
+# ============================================================
+
 def calculate_joint_probability(assignment, node_states, cpts_map):
+    """
+    Menghitung probabilitas gabungan:
+    P(X1, X2, ..., Xn)
+
+    Menggunakan chain rule Bayesian Network:
+    ∏ P(Xi | Parents(Xi))
+    """
     prob = 1.0
-    # iterate nodes in any order (product rule uses P(Xi | parents(Xi)))
+
     for (node, parents) in cpts_map.keys():
         parents = list(parents)
-        # build parent evidence
         parent_evidence = {p: assignment[p] for p in parents}
         node_state = assignment[node]
-        p = get_probability(node, node_state, parent_evidence, node_states, cpts_map)
-        prob *= p
+
+        # Kalikan probabilitas lokal
+        prob *= get_probability(
+            node, node_state, parent_evidence,
+            node_states, cpts_map
+        )
+
     return prob
 
-# -----------------------
-# Infer posterior P(query_node | evidence) by enumeration (exact marginalization)
-# unobserved variables are all nodes not in evidence and not query_node
-# -----------------------
+
+# ============================================================
+# INFERENSI POSTERIOR (EXACT ENUMERATION)
+# ============================================================
+
 def infer_posterior(query_node, evidence, node_states, cpts_map):
-    all_nodes = list({n for (n,_) in cpts_map.keys()})
+    """
+    Menghitung probabilitas posterior:
+    P(query_node | evidence)
+
+    Menggunakan metode exact inference dengan enumerasi
+    seluruh variabel tersembunyi.
+    """
+
+    all_nodes = list({n for (n, _) in cpts_map.keys()})
     states_q = node_states[query_node]
+
+    # Inisialisasi hasil posterior
     result = {s: 0.0 for s in states_q}
-    unobserved = [n for n in all_nodes if n not in evidence and n != query_node]
+
+    # Variabel tersembunyi (tidak di-query dan tidak di-evidence)
+    unobserved = [
+        n for n in all_nodes
+        if n not in evidence and n != query_node
+    ]
 
     from itertools import product
-    # iterate over all states of unobserved variables
     states_lists = [node_states[n] for n in unobserved]
+
+    # Enumerasi semua kemungkinan variabel tersembunyi
     for combo in product(*states_lists) if states_lists else [()]:
         assign = dict(zip(unobserved, combo))
+
         for s in states_q:
             full_assign = {**evidence, **assign, query_node: s}
-            result[s] += calculate_joint_probability(full_assign, node_states, cpts_map)
-    # normalize
-    tot = sum(result.values())
-    if tot > 0:
+
+            # Hitung joint probability
+            result[s] += calculate_joint_probability(
+                full_assign, node_states, cpts_map
+            )
+
+    # Normalisasi agar menjadi distribusi probabilitas valid
+    total = sum(result.values())
+    if total > 0:
         for k in result:
-            result[k] /= tot
+            result[k] /= total
+
     return result
 
-# -----------------------
-# Visualization: network + annotate nodes with CPT snippet (first few probs or full)
-# -----------------------
+
+# ============================================================
+# VISUALISASI BAYESIAN NETWORK
+# Menampilkan struktur DAG dan ringkasan CPT
+# ============================================================
+
 def visualize_bayesian_network(cpts_map, node_states, show_cpt_full=False, figsize=(14,10)):
+    # Membuat graf berarah (Directed Acyclic Graph)
+    # Graf ini merepresentasikan struktur kausal Bayesian Network
     G = nx.DiGraph()
+
+    # Mengambil semua node unik dari CPT
     nodes = sorted({n for (n,_) in cpts_map.keys()})
+
+    # Menambahkan node ke graf
     for n in nodes:
         G.add_node(n)
+
+    # Menambahkan edge dari parent ke child sesuai struktur BN
     for (child, parents) in cpts_map.keys():
         for p in parents:
             G.add_edge(p, child)
 
-    # level layout
+    # ========================================================
+    # MENENTUKAN LEVEL NODE (ROOT → LEAF)
+    # ========================================================
+    # Tujuan: memastikan layout mengikuti arah kausal
     def get_node_levels(graph):
         levels = {}
+
+        # Root node adalah node tanpa incoming edge
         roots = [n for n in graph.nodes() if graph.in_degree(n) == 0]
+
+        # BFS untuk menentukan kedalaman node
         queue = [(r, 0) for r in roots]
         visited = set(roots)
+
         while queue:
             node, lvl = queue.pop(0)
             levels[node] = lvl
+
+            # Anak node ditempatkan di level berikutnya
             for ch in graph.successors(node):
                 if ch not in visited:
                     visited.add(ch)
                     queue.append((ch, lvl+1))
-        # nodes not reached (cycles?) -> place at max+1
+
+        # Jika ada node yang tidak terjangkau (keamanan tambahan)
         for n in graph.nodes():
             if n not in levels:
-                levels[n] = max(levels.values())+1
+                levels[n] = max(levels.values()) + 1
+
         return levels
 
+    # Menghitung level setiap node
     levels = get_node_levels(G)
+
+    # Mengelompokkan node berdasarkan level
     level_nodes = {}
     for n, l in levels.items():
         level_nodes.setdefault(l, []).append(n)
+
+    # Menentukan posisi (x, y) node agar tersusun rapi
     pos = {}
     for lvl, nodes_at in level_nodes.items():
         num = len(nodes_at)
         for i, node in enumerate(nodes_at):
-            x = (i - num/2) * 2.5
-            y = -lvl * 3
+            x = (i - num/2) * 2.5   # Spasi horizontal
+            y = -lvl * 3            # Spasi vertikal antar level
             pos[node] = (x, y)
 
+    # ========================================================
+    # MENGGAMBAR GRAF BAYESIAN NETWORK
+    # ========================================================
     plt.figure(figsize=figsize)
-    nx.draw_networkx_edges(G, pos, arrows=True, arrowsize=20, width=1.8)
-    nx.draw_networkx_nodes(G, pos, node_size=2000, node_color='lightblue')
+
+    # Menggambar edge (hubungan kausal)
+    nx.draw_networkx_edges(
+        G, pos, arrows=True,
+        arrowsize=20, width=1.8
+    )
+
+    # Menggambar node
+    nx.draw_networkx_nodes(
+        G, pos,
+        node_size=2000,
+        node_color='lightblue'
+    )
+
+    # Menampilkan label node
     nx.draw_networkx_labels(G, pos, font_size=10)
 
-    # annotate CPT (as small text near node)
+    # ========================================================
+    # ANOTASI CPT PADA NODE
+    # ========================================================
+    # Tujuan: memberikan informasi probabilistik secara ringkas
     for node in nodes:
-        # find its cpt
         for (n, parents), probs in cpts_map.items():
             if n == node:
+
+                # Jika ingin menampilkan CPT lengkap
                 if show_cpt_full:
-                    txt = "parents: {}\n{}".format(" ".join(parents) if parents else "-", " ".join([f"{p:.3f}" for p in probs]))
+                    txt = (
+                        "parents: {}\n{}"
+                        .format(
+                            " ".join(parents) if parents else "-",
+                            " ".join([f"{p:.3f}" for p in probs])
+                        )
+                    )
                 else:
-                    # show up to first 9 numbers
+                    # Default: hanya tampilkan ukuran CPT
                     txt = "p(len={})".format(len(probs))
-                plt.text(pos[node][0], pos[node][1]-0.6, txt,
-                         fontsize=8, ha='center', va='top', bbox=dict(facecolor='white', alpha=0.7, boxstyle='round'))
+
+                # Tampilkan teks di bawah node
+                plt.text(
+                    pos[node][0],
+                    pos[node][1] - 0.6,
+                    txt,
+                    fontsize=8,
+                    ha='center',
+                    va='top',
+                    bbox=dict(
+                        facecolor='white',
+                        alpha=0.7,
+                        boxstyle='round'
+                    )
+                )
                 break
 
-    legend_elements = [Patch(facecolor='lightblue', label='Nodes')]
+    # Legenda sederhana
+    legend_elements = [
+        Patch(facecolor='lightblue', label='Nodes')
+    ]
     plt.legend(handles=legend_elements, loc='upper left')
+
     plt.axis('off')
     plt.title("Bayesian Network (nodes & CPT summary)")
     plt.tight_layout()
     plt.show()
 
-# -----------------------
-# Evaluation helpers:
-#  - log_likelihood of dataset under model
-#  - node_prediction_accuracy: predict node by argmax P(node|parents) on each row and compute accuracy
-#  - BIC: -2*loglik + k*ln(N) where k = number of free parameters
-# -----------------------
+
+# ============================================================
+# EVALUASI MODEL BAYESIAN NETWORK
+# ============================================================
+
 def log_likelihood(df, node_states, cpts_map):
+    """
+    Menghitung log-likelihood dataset terhadap model Bayesian Network.
+
+    Secara teori:
+    log P(Data | Model) = Σ log P(x_i | CPT)
+    """
     ll = 0.0
-    for idx, row in df.iterrows():
-        # compute joint prob for this complete row
+
+    for _, row in df.iterrows():
+        # Mengubah satu baris data menjadi assignment lengkap
         assign = row.to_dict()
+
+        # Hitung joint probability untuk satu observasi
         p = calculate_joint_probability(assign, node_states, cpts_map)
+
+        # Jika probabilitas valid, tambahkan log-nya
         if p > 0:
             ll += np.log(p)
         else:
-            # very small penalty for zero-prob entries
+            # Penalti besar jika probabilitas nol
+            # (menandakan model tidak menjelaskan data)
             ll += -1e6
+
     return ll
 
+
 def node_prediction_accuracy(df, node_states, cpts_map):
+    """
+    Mengukur akurasi prediksi tiap node berdasarkan CPT.
+
+    Prediksi dilakukan dengan:
+    argmax P(node | parents)
+
+    Ini bukan supervised learning,
+    melainkan evaluasi konsistensi probabilistik.
+    """
     accs = {}
+
     for (node, parents) in cpts_map.keys():
         parents = list(parents)
+
+        # Jika node tanpa parent → gunakan distribusi marginal
         if len(parents) == 0:
-            # predict using marginal
             probs = cpts_map[(node, tuple(parents))]
             pred = node_states[node][int(np.argmax(probs))]
             accs[node] = (df[node] == pred).mean()
+
         else:
             correct = 0
-            for idx, row in df.iterrows():
+
+            for _, row in df.iterrows():
+                # Ambil evidence parent
                 parent_evidence = {p: row[p] for p in parents}
-                # compute P(node=state|parents)
-                probs = []
-                for s in node_states[node]:
-                    probs.append(get_probability(node, s, parent_evidence, node_states, cpts_map))
-                if sum(probs) == 0:
-                    pred = None
-                else:
+
+                # Hitung probabilitas untuk setiap state node
+                probs = [
+                    get_probability(
+                        node, s, parent_evidence,
+                        node_states, cpts_map
+                    )
+                    for s in node_states[node]
+                ]
+
+                # Prediksi state dengan probabilitas maksimum
+                if sum(probs) > 0:
                     pred = node_states[node][int(np.argmax(probs))]
+                else:
+                    pred = None
+
                 if pred == row[node]:
                     correct += 1
+
             accs[node] = correct / len(df)
+
     return accs
 
+
 def number_of_parameters(cpts_map, node_states):
+    """
+    Menghitung jumlah parameter bebas dalam Bayesian Network.
+
+    Secara teori:
+    Untuk setiap CPT:
+    (jumlah kombinasi parent) × (jumlah state - 1)
+    """
     k = 0
-    for (node, parents), probs in cpts_map.items():
+
+    for (node, parents), _ in cpts_map.items():
         s = len(node_states[node])
-        # free parameters per parent combination = s-1
+
+        # Menghitung kardinalitas parent
         parent_card = 1
         for p in parents:
             parent_card *= len(node_states[p])
+
+        # Parameter bebas
         k += parent_card * (s - 1)
+
     return k
 
+
 def bic(df, node_states, cpts_map):
+    """
+    Bayesian Information Criterion (BIC)
+
+    BIC = -2 log L + k log n
+
+    Digunakan untuk menilai trade-off
+    antara kecocokan data dan kompleksitas model.
+    """
     ll = log_likelihood(df, node_states, cpts_map)
     k = number_of_parameters(cpts_map, node_states)
     n = len(df)
-    return -2*ll + k * np.log(n)
 
+    return -2 * ll + k * np.log(n)
+
+
+# ============================================================
+# VISUALISASI CPT DALAM BENTUK TABEL
+# ============================================================
 
 def visualize_cpt_table(node, parents, cpt_dict):
+    """
+    Menampilkan CPT node dalam bentuk tabel
+    untuk interpretasi manusia.
+    """
     print(f"CPT for node: {node}")
     print(f"Parents: {parents}")
 
-    # Jika CPT adalah dict satu level
+    # Jika CPT berbentuk dictionary
     if isinstance(cpt_dict, dict):
-        df = pd.DataFrame.from_dict(cpt_dict, orient='index', columns=['Probability'])
+        df = pd.DataFrame.from_dict(
+            cpt_dict,
+            orient='index',
+            columns=['Probability']
+        )
         display(df)
         return
 
-    # Jika CPT adalah list of dicts (umum di BN)
+    # Jika CPT berupa list of dict
     if isinstance(cpt_dict, list) and isinstance(cpt_dict[0], dict):
         df = pd.DataFrame(cpt_dict)
         display(df)
         return
 
-    # Default: fallback ke bentuk lama
+    # Jika CPT berupa flattened list
     cpt_values = np.array(cpt_dict)
     num_states = cpt_values.shape[-1]
     rows = len(cpt_values) // num_states
@@ -359,14 +564,20 @@ def visualize_cpt_table(node, parents, cpt_dict):
     ax.axis('off')
     ax.table(cellText=table, loc='center')
     plt.show()
-    
+
+
 def visualize_bn_with_cpts(G, cpts, pos=None):
+    """
+    Menampilkan graf Bayesian Network
+    dan CPT setiap node secara terpisah.
+    """
     plt.figure(figsize=(16, 10))
-    
+
+    # Jika posisi node belum ditentukan, gunakan spring layout
     if pos is None:
         pos = nx.spring_layout(G, seed=42, k=0.9)
 
-    # Draw Graph
+    # Menggambar node, edge, dan label
     nx.draw_networkx_nodes(G, pos, node_color="#a9d6e5", node_size=1800)
     nx.draw_networkx_labels(G, pos, font_size=12, font_weight='bold')
     nx.draw_networkx_edges(G, pos, arrows=True, arrowstyle="->", width=2)
@@ -375,7 +586,7 @@ def visualize_bn_with_cpts(G, cpts, pos=None):
     plt.axis('off')
     plt.show()
 
-    # Draw CPT tables beside each node
+    # Menampilkan CPT setiap node
     for (node, parents), cpt_values in cpts.items():
         print(f"=== CPT for {node} ===")
         visualize_cpt_table(node, list(parents), cpt_values)
